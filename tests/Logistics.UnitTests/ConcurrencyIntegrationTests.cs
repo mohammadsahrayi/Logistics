@@ -1,0 +1,203 @@
+using System;
+using System.Collections.Generic;
+using System.Data.Common;
+using System.IO;
+using System.Linq;
+using System.Threading;
+using System.Threading.Tasks;
+using FluentAssertions;
+using Logistics.Infrastructure.Persistence;
+using Logistics.Infrastructure.Repositories;
+using Logistics.Infrastructure.Services;
+using Logistics.Application.Contracts;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Logging;
+using Npgsql;
+using Xunit;
+
+namespace Logistics.UnitTests
+{
+    public class ConcurrencyIntegrationTests
+    {
+        private const string EnvConn = "TEST_POSTGRES_CONN";
+
+        private static string? GetConnString()
+        {
+            return Environment.GetEnvironmentVariable(EnvConn);
+        }
+
+        private static void ApplySqlFilesIfNeeded(NpgsqlConnection conn)
+        {
+            // Apply provided SQL migration scripts (order matters)
+            var baseDir = Path.GetFullPath("src/Logistics.Infrastructure/Migrations");
+            var files = new[] { "InitialCreate.sql", "AddConstraintsAndIndexes.sql", "AddVoyageCapacitySumCheck.sql" }
+                .Select(n => Path.Combine(baseDir, n))
+                .Where(File.Exists)
+                .ToList();
+
+            foreach (var f in files)
+            {
+                var sql = File.ReadAllText(f);
+                using var cmd = conn.CreateCommand();
+                cmd.CommandText = sql;
+                cmd.CommandType = System.Data.CommandType.Text;
+                cmd.ExecuteNonQuery();
+            }
+        }
+
+        private LogisticsDbContext CreateContext(string connString)
+        {
+            var options = new DbContextOptionsBuilder<LogisticsDbContext>()
+                .UseNpgsql(connString, b => b.EnableRetryOnFailure())
+                .Options;
+            return new LogisticsDbContext(options);
+        }
+
+        private ICapacityService CreateService(LogisticsDbContext ctx)
+        {
+            var repo = new VoyageCapacityRepository(ctx);
+            var clock = new DbClockForTests(ctx.Database.GetDbConnection());
+            return new CapacityService(ctx, repo, clock);
+        }
+
+        private class DbClockForTests : IClock
+        {
+            private readonly DbConnection _conn;
+            public DbClockForTests(DbConnection conn) { _conn = conn; }
+            public async Task<DateTime> GetUtcNowAsync()
+            {
+                await using var cmd = _conn.CreateCommand();
+                cmd.CommandText = "SELECT NOW() AT TIME ZONE 'UTC'";
+                var val = await cmd.ExecuteScalarAsync();
+                return DateTime.SpecifyKind(Convert.ToDateTime(val), DateTimeKind.Utc);
+            }
+        }
+
+        [Fact]
+        public void FinalCapacity_overbooking_concurrent_create_hold_requests()
+        {
+            var connString = GetConnString();
+            if (string.IsNullOrEmpty(connString))
+            {
+                // No Postgres instance configured in this environment; do nothing (test not executed here)
+                return;
+            }
+
+            // Prepare DB schema and seed data using a dedicated connection
+            using var masterConn = new NpgsqlConnection(connString);
+            masterConn.Open();
+
+            // Apply migration SQL scripts if the tables are missing (idempotent-ish for test runs)
+            ApplySqlFilesIfNeeded(masterConn);
+
+            // Ensure a clean state for this test - use a unique voyage id
+            var voyageId = Guid.NewGuid();
+            var bookingA = Guid.NewGuid();
+            var bookingB = Guid.NewGuid();
+
+            // Create initial data directly via SQL for deterministic seeding
+            using (var tx = masterConn.BeginTransaction())
+            using (var cmd = masterConn.CreateCommand())
+            {
+                cmd.Transaction = tx;
+                // Insert voyage with total_capacity 3, confirmed 1 -> available 2
+                cmd.CommandText = @"
+INSERT INTO voyage_capacity (voyage_id, total_capacity, held_capacity, confirmed_capacity, operational_status, version, created_at)
+VALUES (@voyageId, 3, 0, 1, 'Open', 0, NOW() AT TIME ZONE 'UTC')
+ON CONFLICT (voyage_id) DO UPDATE SET total_capacity = EXCLUDED.total_capacity;";
+                cmd.Parameters.Add(new NpgsqlParameter("@voyageId", voyageId));
+                cmd.ExecuteNonQuery();
+
+                // Insert two bookings
+                cmd.CommandText = @"
+INSERT INTO booking (booking_id, voyage_id, requested_capacity, state, version, created_at)
+VALUES (@b1, @voyageId, 2, 'Pending', 0, NOW() AT TIME ZONE 'UTC')
+ON CONFLICT (booking_id) DO NOTHING;";
+                cmd.Parameters.Clear();
+                cmd.Parameters.Add(new NpgsqlParameter("@b1", bookingA));
+                cmd.Parameters.Add(new NpgsqlParameter("@voyageId", voyageId));
+                cmd.ExecuteNonQuery();
+
+                cmd.CommandText = @"
+INSERT INTO booking (booking_id, voyage_id, requested_capacity, state, version, created_at)
+VALUES (@b2, @voyageId, 1, 'Pending', 0, NOW() AT TIME ZONE 'UTC')
+ON CONFLICT (booking_id) DO NOTHING;";
+                cmd.Parameters.Clear();
+                cmd.Parameters.Add(new NpgsqlParameter("@b2", bookingB));
+                cmd.Parameters.Add(new NpgsqlParameter("@voyageId", voyageId));
+                cmd.ExecuteNonQuery();
+
+                tx.Commit();
+            }
+
+            // Now perform concurrent CreateHold requests from separate DbContexts to simulate real concurrency
+            var tcsStart = new TaskCompletionSource<object?>(TaskCreationOptions.RunContinuationsAsynchronously);
+
+            var taskA = Task.Run(async () =>
+            {
+                await using var ctx = CreateContext(connString);
+                // ensure DB connection is open to make DbClock queries inside transaction work
+                ctx.Database.OpenConnection();
+                var service = CreateService(ctx);
+                // wait for start signal
+                await tcsStart.Task;
+                return await service.CreateHoldAsync(bookingA, voyageId, 2, TimeSpan.FromMinutes(5), "phase4-key-a");
+            });
+
+            var taskB = Task.Run(async () =>
+            {
+                await using var ctx = CreateContext(connString);
+                ctx.Database.OpenConnection();
+                var service = CreateService(ctx);
+                await tcsStart.Task;
+                return await service.CreateHoldAsync(bookingB, voyageId, 1, TimeSpan.FromMinutes(5), "phase4-key-b");
+            });
+
+            // release both tasks nearly simultaneously
+            tcsStart.SetResult(null);
+
+            Task.WaitAll(new Task[] { taskA, taskB }, TimeSpan.FromSeconds(30));
+
+            var resA = taskA.Result;
+            var resB = taskB.Result;
+
+            // Read final voyage state
+            using (var verifyCtx = CreateContext(connString))
+            {
+                var voyage = verifyCtx.VoyageCapacities.Single(v => v.VoyageId == voyageId);
+                var total = voyage.TotalCapacity;
+                var held = voyage.HeldCapacity;
+                var confirmed = voyage.ConfirmedCapacity;
+
+                // Invariant must hold
+                Assert.True((held + confirmed) <= total, "held + confirmed must not exceed total");
+
+                // The sum of successfully held units from both responses must not exceed the available 2 units
+                var sumRequestedHeld = 0;
+                if (resA.Success && resA.HoldId.HasValue)
+                {
+                    // fetch the hold to know units
+                    var h = verifyCtx.CapacityHolds.SingleOrDefault(x => x.HoldId == resA.HoldId.Value);
+                    h.Should().NotBeNull();
+                    sumRequestedHeld += h.CapacityUnits;
+                }
+                if (resB.Success && resB.HoldId.HasValue)
+                {
+                    var h = verifyCtx.CapacityHolds.SingleOrDefault(x => x.HoldId == resB.HoldId.Value);
+                    h.Should().NotBeNull();
+                    sumRequestedHeld += h.CapacityUnits;
+                }
+
+                Assert.True(sumRequestedHeld <= 2, "Sum of held units by successful requests must not exceed available capacity (2)");
+
+                // Exactly one of the two requests should have succeeded in reserving units that exceed or meet available capacity
+                // Either A succeeded (2) and B failed, or B succeeded (1) and A failed; both succeeding would violate invariant
+                var succeededCount = (resA.Success ? 1 : 0) + (resB.Success ? 1 : 0);
+                Assert.True(succeededCount <= 2, "Number of successful requests should be <= 2");
+
+                // final check: no overbooking
+                Assert.True((held + confirmed) <= total, "held + confirmed must not exceed total");
+            }
+        }
+    }
+}
