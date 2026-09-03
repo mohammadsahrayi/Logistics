@@ -54,5 +54,18 @@ namespace Logistics.UnitTests
             Action second = () => h.Expire(now.AddMinutes(3));
             second.Should().NotThrow();
         }
+
+        [Fact]
+        public void Confirmed_hold_cannot_expire_as_a_second_terminal_effect()
+        {
+            var now = DateTime.UtcNow;
+            var h = new CapacityHold(Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid(), 2, now, TimeSpan.FromMinutes(5));
+
+            h.Confirm(now.AddMinutes(1));
+
+            Action expire = () => h.Expire(now.AddMinutes(6));
+            expire.Should().NotThrow();
+            h.Status.Should().Be(HoldStatus.Confirmed);
+        }
     }
 }

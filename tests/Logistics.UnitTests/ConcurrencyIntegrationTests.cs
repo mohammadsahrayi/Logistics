@@ -17,6 +17,7 @@ using Xunit;
 
 namespace Logistics.UnitTests
 {
+    [Collection("Postgres integration")]
     public class ConcurrencyIntegrationTests
     {
         private const string EnvConn = "TEST_POSTGRES_CONN";
@@ -28,16 +29,34 @@ namespace Logistics.UnitTests
 
         private static void ApplySqlFilesIfNeeded(NpgsqlConnection conn)
         {
-            // Apply provided SQL migration scripts (order matters)
-            var baseDir = Path.GetFullPath("src/Logistics.Infrastructure/Migrations");
-            var files = new[] { "InitialCreate.sql", "AddConstraintsAndIndexes.sql", "AddVoyageCapacitySumCheck.sql" }
-                .Select(n => Path.Combine(baseDir, n))
-                .Where(File.Exists)
-                .ToList();
-
-            foreach (var f in files)
+            var baseDir = FindRepositoryRoot().FullName is var root
+                ? Path.Combine(root, "src", "Logistics.Infrastructure", "Migrations")
+                : throw new DirectoryNotFoundException("Repository root was not found");
+            var migrations = new[]
             {
-                var sql = File.ReadAllText(f);
+                ("20260901185816_InitialCreate", "InitialCreate.sql"),
+                ("20260901191623_AddConstraintsAndIndexes", "AddConstraintsAndIndexes.sql"),
+                ("20260901191927_AddVoyageCapacitySumCheck", "AddVoyageCapacitySumCheck.sql"),
+                ("20260903160050_AddBookingConfirmationProjection", "AddBookingConfirmationProjection.sql"),
+                ("20260903163148_AddActiveHoldUniqueness", "AddActiveHoldUniqueness.sql")
+            };
+
+            using (var createHistoryCommand = conn.CreateCommand())
+            {
+                createHistoryCommand.CommandText = "CREATE TABLE IF NOT EXISTS \"__EFMigrationsHistory\" (\"MigrationId\" character varying(150) NOT NULL, \"ProductVersion\" character varying(32) NOT NULL, CONSTRAINT \"PK___EFMigrationsHistory\" PRIMARY KEY (\"MigrationId\"))";
+                createHistoryCommand.ExecuteNonQuery();
+            }
+
+            foreach (var (migrationId, fileName) in migrations)
+            {
+                using var historyCommand = conn.CreateCommand();
+                historyCommand.CommandText = "SELECT EXISTS (SELECT 1 FROM \"__EFMigrationsHistory\" WHERE \"MigrationId\" = @id)";
+                historyCommand.Parameters.AddWithValue("id", migrationId);
+                if (Convert.ToBoolean(historyCommand.ExecuteScalar())) continue;
+
+                var file = Path.Combine(baseDir, fileName);
+                if (!File.Exists(file)) throw new FileNotFoundException("Migration script is missing", file);
+                var sql = File.ReadAllText(file);
                 using var cmd = conn.CreateCommand();
                 cmd.CommandText = sql;
                 cmd.CommandType = System.Data.CommandType.Text;
@@ -45,10 +64,18 @@ namespace Logistics.UnitTests
             }
         }
 
+        private static DirectoryInfo FindRepositoryRoot()
+        {
+            var directory = new DirectoryInfo(AppContext.BaseDirectory);
+            while (directory != null && !File.Exists(Path.Combine(directory.FullName, "Logistics.slnx")))
+                directory = directory.Parent;
+            return directory ?? throw new DirectoryNotFoundException("Repository root was not found");
+        }
+
         private LogisticsDbContext CreateContext(string connString)
         {
             var options = new DbContextOptionsBuilder<LogisticsDbContext>()
-                .UseNpgsql(connString, b => b.EnableRetryOnFailure())
+                .UseNpgsql(connString)
                 .Options;
             return new LogisticsDbContext(options);
         }
@@ -74,13 +101,12 @@ namespace Logistics.UnitTests
         }
 
         [Fact]
-        public void FinalCapacity_overbooking_concurrent_create_hold_requests()
+        public async Task FinalCapacity_overbooking_concurrent_create_hold_requests()
         {
             var connString = GetConnString();
             if (string.IsNullOrEmpty(connString))
             {
-                // No Postgres instance configured in this environment; do nothing (test not executed here)
-                return;
+            throw new InvalidOperationException("TEST_POSTGRES_CONN must be configured; concurrency evidence cannot be skipped.");
             }
 
             // Prepare DB schema and seed data using a dedicated connection
@@ -131,35 +157,29 @@ ON CONFLICT (booking_id) DO NOTHING;";
             }
 
             // Now perform concurrent CreateHold requests from separate DbContexts to simulate real concurrency
-            var tcsStart = new TaskCompletionSource<object?>(TaskCreationOptions.RunContinuationsAsynchronously);
+            var startGate = new Barrier(2);
 
             var taskA = Task.Run(async () =>
             {
                 await using var ctx = CreateContext(connString);
-                // ensure DB connection is open to make DbClock queries inside transaction work
-                ctx.Database.OpenConnection();
+                await ctx.Database.OpenConnectionAsync();
                 var service = CreateService(ctx);
-                // wait for start signal
-                await tcsStart.Task;
+                startGate.SignalAndWait(TimeSpan.FromSeconds(10));
                 return await service.CreateHoldAsync(bookingA, voyageId, 2, TimeSpan.FromMinutes(5), "phase4-key-a");
             });
 
             var taskB = Task.Run(async () =>
             {
                 await using var ctx = CreateContext(connString);
-                ctx.Database.OpenConnection();
+                await ctx.Database.OpenConnectionAsync();
                 var service = CreateService(ctx);
-                await tcsStart.Task;
+                startGate.SignalAndWait(TimeSpan.FromSeconds(10));
                 return await service.CreateHoldAsync(bookingB, voyageId, 1, TimeSpan.FromMinutes(5), "phase4-key-b");
             });
 
-            // release both tasks nearly simultaneously
-            tcsStart.SetResult(null);
-
-            Task.WaitAll(new Task[] { taskA, taskB }, TimeSpan.FromSeconds(30));
-
-            var resA = taskA.Result;
-            var resB = taskB.Result;
+            var results = await Task.WhenAll(taskA, taskB);
+            var resA = results[0];
+            var resB = results[1];
 
             // Read final voyage state
             using (var verifyCtx = CreateContext(connString))
@@ -193,7 +213,8 @@ ON CONFLICT (booking_id) DO NOTHING;";
                 // Exactly one of the two requests should have succeeded in reserving units that exceed or meet available capacity
                 // Either A succeeded (2) and B failed, or B succeeded (1) and A failed; both succeeding would violate invariant
                 var succeededCount = (resA.Success ? 1 : 0) + (resB.Success ? 1 : 0);
-                Assert.True(succeededCount <= 2, "Number of successful requests should be <= 2");
+                succeededCount.Should().Be(1, $"the two requests together require 3 units but only 2 are available; A={resA.Reason}, B={resB.Reason}");
+                held.Should().Be(resA.Success ? 2 : 1);
 
                 // final check: no overbooking
                 Assert.True((held + confirmed) <= total, "held + confirmed must not exceed total");

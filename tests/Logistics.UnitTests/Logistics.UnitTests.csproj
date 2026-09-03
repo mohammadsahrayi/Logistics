@@ -29,6 +29,6 @@
   </ItemGroup>
   <ItemGroup>
     <PackageReference Include="Npgsql.EntityFrameworkCore.PostgreSQL" Version="8.0.10" />
-    <PackageReference Include="Npgsql" Version="8.0.10" />
+    <PackageReference Include="Npgsql" Version="8.0.8" />
   </ItemGroup>
 </Project>

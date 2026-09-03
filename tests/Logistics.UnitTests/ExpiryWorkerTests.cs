@@ -95,5 +95,59 @@ namespace Logistics.UnitTests
             Assert.Equal("CapacityHoldExpired", outbox.MessageType);
             Assert.False(outbox.Processed);
         }
+
+        [Fact]
+        public async Task Overdue_hold_is_released_after_context_restart()
+        {
+            var databasePath = Path.Combine(Path.GetTempPath(), $"logistics-{Guid.NewGuid():N}.db");
+            try
+            {
+                var voyageId = Guid.NewGuid();
+                var bookingId = Guid.NewGuid();
+                var holdId = Guid.NewGuid();
+                var expiredAt = DateTime.UtcNow.AddMinutes(-1);
+
+                await using (var initialConnection = new SqliteConnection($"Data Source={databasePath}"))
+                {
+                    await initialConnection.OpenAsync();
+                    await using var initialContext = CreateContext(initialConnection);
+                    await initialContext.Database.EnsureCreatedAsync();
+                    initialContext.VoyageCapacities.Add(new VoyageCapacityEntity { VoyageId = voyageId, TotalCapacity = 10, HeldCapacity = 1, OperationalStatus = "Open", CreatedAt = DateTime.UtcNow });
+                    initialContext.Bookings.Add(new BookingEntity { BookingId = bookingId, VoyageId = voyageId, RequestedCapacity = 1, State = "Pending", ActiveHoldId = holdId, CreatedAt = DateTime.UtcNow });
+                    initialContext.CapacityHolds.Add(new CapacityHoldEntity { HoldId = holdId, BookingId = bookingId, VoyageId = voyageId, CapacityUnits = 1, CreatedAt = expiredAt.AddMinutes(-5), ExpiresAt = expiredAt, Status = "Active" });
+                    await initialContext.SaveChangesAsync();
+                }
+
+                var processed = 0;
+                await using (var restartedConnection = new SqliteConnection($"Data Source={databasePath}"))
+                {
+                    await restartedConnection.OpenAsync();
+                    await using (var restartedContext = CreateContext(restartedConnection))
+                    {
+                        var worker = new ExpiryWorker(
+                            restartedContext,
+                            new VoyageCapacityRepository(restartedContext),
+                            new TestClock(DateTime.UtcNow),
+                            new Microsoft.Extensions.Logging.Abstractions.NullLogger<ExpiryWorker>());
+
+                        processed = await worker.ProcessExpiredHoldsOnceAsync();
+
+                        processed.Should().Be(1);
+                        (await restartedContext.CapacityHolds.FindAsync(holdId)).Status.Should().Be("Expired");
+                        (await restartedContext.VoyageCapacities.FindAsync(voyageId)).HeldCapacity.Should().Be(0);
+                    }
+                }
+            }
+            finally
+            {
+                try
+                {
+                    File.Delete(databasePath);
+                }
+                catch (IOException)
+                {
+                }
+            }
+        }
     }
 }

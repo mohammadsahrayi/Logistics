@@ -1,5 +1,6 @@
 using Logistics.Infrastructure.Persistence;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Logging;
 using System;
 using System.Linq;
 using System.Threading;
@@ -11,11 +12,18 @@ namespace Logistics.Infrastructure.Services
     {
         private readonly LogisticsDbContext _db;
         private readonly IMessageSender _sender;
+        private readonly ILogger<OutboxPublisher> _logger;
 
         public OutboxPublisher(LogisticsDbContext db, IMessageSender sender)
+            : this(db, sender, Microsoft.Extensions.Logging.Abstractions.NullLogger<OutboxPublisher>.Instance)
+        {
+        }
+
+        public OutboxPublisher(LogisticsDbContext db, IMessageSender sender, ILogger<OutboxPublisher> logger)
         {
             _db = db ?? throw new ArgumentNullException(nameof(db));
             _sender = sender ?? throw new ArgumentNullException(nameof(sender));
+            _logger = logger ?? throw new ArgumentNullException(nameof(logger));
         }
 
         public async Task<int> PublishPendingAsync(int batchSize = 10, CancellationToken ct = default)
@@ -28,6 +36,7 @@ namespace Logistics.Infrastructure.Services
                 .ToListAsync(ct);
 
             var processedCount = 0;
+            LogisticsMetrics.OutboxBacklog.Record(pending.Count);
 
             foreach (var msg in pending)
             {
@@ -47,6 +56,7 @@ namespace Logistics.Infrastructure.Services
                     _db.OutboxMessages.Update(msg);
                     await _db.SaveChangesAsync(ct);
 
+                    _logger.LogInformation("Outbox message published {MessageId} of type {MessageType}", msg.Id, msg.MessageType);
                     processedCount++;
                 }
                 catch (Exception ex)
@@ -56,6 +66,7 @@ namespace Logistics.Infrastructure.Services
                     msg.LastError = ex.Message;
                     _db.OutboxMessages.Update(msg);
                     await _db.SaveChangesAsync(ct);
+                    _logger.LogWarning(ex, "Outbox publication failed {MessageId} of type {MessageType}", msg.Id, msg.MessageType);
                     // continue with other messages
                 }
             }

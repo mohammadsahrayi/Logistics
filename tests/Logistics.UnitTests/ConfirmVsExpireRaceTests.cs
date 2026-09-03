@@ -14,6 +14,7 @@ using Xunit;
 
 namespace Logistics.UnitTests
 {
+    [Collection("Postgres integration")]
     public class ConfirmVsExpireRaceTests
     {
         private const string EnvConn = "TEST_POSTGRES_CONN";
@@ -23,7 +24,7 @@ namespace Logistics.UnitTests
         private LogisticsDbContext CreateContext(string connString)
         {
             var options = new DbContextOptionsBuilder<LogisticsDbContext>()
-                .UseNpgsql(connString, b => b.EnableRetryOnFailure())
+                .UseNpgsql(connString)
                 .Options;
             return new LogisticsDbContext(options);
         }
@@ -53,19 +54,39 @@ namespace Logistics.UnitTests
         {
             var connString = GetConnString();
             if (string.IsNullOrEmpty(connString))
-            {
-                return; // no Postgres here
-            }
+                throw new InvalidOperationException("TEST_POSTGRES_CONN must be configured; concurrency evidence cannot be skipped.");
 
             await using var masterConn = new NpgsqlConnection(connString);
             masterConn.Open();
 
             // Apply migrations if present
-            var baseDir = Path.GetFullPath("src/Logistics.Infrastructure/Migrations");
-            var files = new[] { "InitialCreate.sql", "AddConstraintsAndIndexes.sql", "AddVoyageCapacitySumCheck.sql" }
-                .Select(n => Path.Combine(baseDir, n)).Where(File.Exists).ToList();
-            foreach (var f in files)
+            var baseDir = FindRepositoryRoot().FullName is var root
+                ? Path.Combine(root, "src", "Logistics.Infrastructure", "Migrations")
+                : throw new DirectoryNotFoundException("Repository root was not found");
+            var migrations = new[]
             {
+                ("20260901185816_InitialCreate", "InitialCreate.sql"),
+                ("20260901191623_AddConstraintsAndIndexes", "AddConstraintsAndIndexes.sql"),
+                ("20260901191927_AddVoyageCapacitySumCheck", "AddVoyageCapacitySumCheck.sql"),
+                ("20260903160050_AddBookingConfirmationProjection", "AddBookingConfirmationProjection.sql"),
+                ("20260903163148_AddActiveHoldUniqueness", "AddActiveHoldUniqueness.sql")
+            };
+
+            using (var createHistoryCommand = masterConn.CreateCommand())
+            {
+                createHistoryCommand.CommandText = "CREATE TABLE IF NOT EXISTS \"__EFMigrationsHistory\" (\"MigrationId\" character varying(150) NOT NULL, \"ProductVersion\" character varying(32) NOT NULL, CONSTRAINT \"PK___EFMigrationsHistory\" PRIMARY KEY (\"MigrationId\"))";
+                createHistoryCommand.ExecuteNonQuery();
+            }
+
+            foreach (var (migrationId, fileName) in migrations)
+            {
+                using var historyCommand = masterConn.CreateCommand();
+                historyCommand.CommandText = "SELECT EXISTS (SELECT 1 FROM \"__EFMigrationsHistory\" WHERE \"MigrationId\" = @id)";
+                historyCommand.Parameters.AddWithValue("id", migrationId);
+                if (Convert.ToBoolean(historyCommand.ExecuteScalar())) continue;
+
+                var f = Path.Combine(baseDir, fileName);
+                if (!File.Exists(f)) throw new FileNotFoundException("Migration script is missing", f);
                 var sql = File.ReadAllText(f);
                 using var cmd = masterConn.CreateCommand();
                 cmd.CommandText = sql;
@@ -106,10 +127,10 @@ ON CONFLICT (booking_id) DO NOTHING;";
             DateTime expiresAt;
             await using (var ctx = CreateContext(connString))
             {
-                ctx.Database.OpenConnection();
+                await ctx.Database.OpenConnectionAsync();
                 var service = CreateService(ctx);
                 createResult = await service.CreateHoldAsync(bookingId, voyageId, 1, TimeSpan.FromSeconds(1), "phase4-confirm-expire-create");
-                createResult.Success.Should().BeTrue();
+                createResult.Success.Should().BeTrue(createResult.Reason);
                 holdId = createResult.HoldId!.Value;
 
                 var h = await ctx.CapacityHolds.FindAsync(holdId);
@@ -128,19 +149,20 @@ ON CONFLICT (booking_id) DO NOTHING;";
                 {
                     var now = await clock.GetUtcNowAsync();
                     if (now >= expiresAt) break;
-                    if ((DateTime.UtcNow - start).TotalSeconds > 10) break; // timeout
+                    if ((DateTime.UtcNow - start).TotalSeconds > 10)
+                        throw new TimeoutException("Database time did not reach the hold expiry before the test timeout.");
                     await Task.Delay(50);
                 }
             }
 
-            var tcs = new TaskCompletionSource<object?>(TaskCreationOptions.RunContinuationsAsynchronously);
+            var startGate = new Barrier(2);
 
             var confirmTask = Task.Run(async () =>
             {
                 await using var ctx = CreateContext(connString);
-                ctx.Database.OpenConnection();
+                await ctx.Database.OpenConnectionAsync();
                 var service = CreateService(ctx);
-                await tcs.Task; // wait for release
+                startGate.SignalAndWait(TimeSpan.FromSeconds(10));
                 var res = await service.ConfirmBookingAsync(bookingId, holdId, "phase4-confirm");
                 return res;
             });
@@ -148,54 +170,19 @@ ON CONFLICT (booking_id) DO NOTHING;";
             var expireTask = Task.Run(async () =>
             {
                 await using var ctx = CreateContext(connString);
-                ctx.Database.OpenConnection();
-                var repo = new VoyageCapacityRepository(ctx);
+                await ctx.Database.OpenConnectionAsync();
                 var clock = new DbClockForTests(ctx.Database.GetDbConnection());
+                var logger = new Microsoft.Extensions.Logging.Abstractions.NullLogger<ExpiryWorker>();
+                var worker = new ExpiryWorker(ctx, new VoyageCapacityRepository(ctx), clock, logger);
 
-                await tcs.Task;
-
-                // Expire logic: check DB time inside transaction and expire if eligible
-                await using var tx = await ctx.Database.BeginTransactionAsync();
-                var dbNow = await clock.GetUtcNowAsync();
-                var h = await ctx.CapacityHolds.FindAsync(holdId);
-                if (h == null)
-                {
-                    await tx.CommitAsync();
-                    return false;
-                }
-
-                if (h.Status != "Active")
-                {
-                    await tx.CommitAsync();
-                    return false;
-                }
-
-                if (dbNow < h.ExpiresAt)
-                {
-                    await tx.CommitAsync();
-                    return false; // not yet expired
-                }
-
-                // mark expired and release capacity
-                h.Status = "Expired";
-                h.Version++;
-                h.UpdatedAt = dbNow;
-                ctx.CapacityHolds.Update(h);
-
-                await repo.ReleaseReserved(h.VoyageId, h.CapacityUnits);
-
-                await ctx.SaveChangesAsync();
-                await tx.CommitAsync();
-                return true;
+                startGate.SignalAndWait(TimeSpan.FromSeconds(10));
+                return await worker.ProcessExpiredHoldsOnceAsync();
             });
-
-            // release both almost simultaneously
-            tcs.SetResult(null);
 
             await Task.WhenAll(confirmTask, expireTask);
 
-            var confirmRes = confirmTask.Result; // (bool, string?)
-            var expireRes = expireTask.Result; // bool
+            var confirmRes = await confirmTask;
+            var expireRes = await expireTask;
 
             // Verify final persisted state
             await using (var verifyCtx = CreateContext(connString))
@@ -210,6 +197,8 @@ ON CONFLICT (booking_id) DO NOTHING;";
                 var isConfirmed = h.Status == "Confirmed";
                 var isExpired = h.Status == "Expired";
                 (isConfirmed || isExpired).Should().BeTrue();
+                (isConfirmed ^ isExpired).Should().BeTrue();
+                ((confirmRes.Success ? 1 : 0) + (expireRes > 0 ? 1 : 0)).Should().Be(1);
 
                 // If confirmed, confirmed_capacity increased by 1 and held decreased accordingly
                 if (isConfirmed)
@@ -226,6 +215,14 @@ ON CONFLICT (booking_id) DO NOTHING;";
                 // Invariant
                 Assert.True((voyage.HeldCapacity + voyage.ConfirmedCapacity) <= voyage.TotalCapacity, "held + confirmed must not exceed total capacity");
             }
+        }
+
+        private static DirectoryInfo FindRepositoryRoot()
+        {
+            var directory = new DirectoryInfo(AppContext.BaseDirectory);
+            while (directory != null && !File.Exists(Path.Combine(directory.FullName, "Logistics.slnx")))
+                directory = directory.Parent;
+            return directory ?? throw new DirectoryNotFoundException("Repository root was not found");
         }
     }
 }

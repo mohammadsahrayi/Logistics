@@ -1,5 +1,8 @@
 using Logistics.Application.Contracts;
 using Logistics.Infrastructure.Persistence;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Logging;
+using System.Diagnostics;
 using System.Text.Json;
 
 namespace Logistics.Infrastructure.Services
@@ -9,12 +12,19 @@ namespace Logistics.Infrastructure.Services
         private readonly LogisticsDbContext _db;
         private readonly Repositories.VoyageCapacityRepository _voyageRepo;
         private readonly IClock _clock;
+        private readonly ILogger<CapacityService> _logger;
 
         public CapacityService(LogisticsDbContext db, Repositories.VoyageCapacityRepository voyageRepo, IClock clock)
+            : this(db, voyageRepo, clock, Microsoft.Extensions.Logging.Abstractions.NullLogger<CapacityService>.Instance)
+        {
+        }
+
+        public CapacityService(LogisticsDbContext db, Repositories.VoyageCapacityRepository voyageRepo, IClock clock, ILogger<CapacityService> logger)
         {
             _db = db ?? throw new ArgumentNullException(nameof(db));
             _voyageRepo = voyageRepo ?? throw new ArgumentNullException(nameof(voyageRepo));
             _clock = clock ?? throw new ArgumentNullException(nameof(clock));
+            _logger = logger ?? throw new ArgumentNullException(nameof(logger));
         }
 
         private static string ComputeHash(object obj)
@@ -29,6 +39,7 @@ namespace Logistics.Infrastructure.Services
         public async Task<CreateHoldResult> CreateHoldAsync(Guid bookingId, Guid voyageId, int units, TimeSpan ttl, string? idempotencyKey = null)
         {
             if (units <= 0) return new CreateHoldResult(false, null, "units must be > 0");
+            if (ttl <= TimeSpan.Zero) return new CreateHoldResult(false, null, "ttl must be greater than zero");
 
             var requestFingerprint = ComputeHash(new { BookingId = bookingId, VoyageId = voyageId, Units = units, TtlMinutes = ttl.TotalMinutes });
 
@@ -95,6 +106,28 @@ namespace Logistics.Infrastructure.Services
                     return new CreateHoldResult(false, null, "booking not found");
                 }
 
+                if (booking.VoyageId != voyageId)
+                {
+                    await tx.CommitAsync();
+                    return new CreateHoldResult(false, null, "booking does not belong to voyage");
+                }
+
+                if (!string.Equals(booking.State, "Pending", StringComparison.OrdinalIgnoreCase))
+                {
+                    await tx.CommitAsync();
+                    return new CreateHoldResult(false, null, "booking is not pending");
+                }
+
+                if (booking.ActiveHoldId.HasValue)
+                {
+                    var activeHold = await _db.CapacityHolds.FindAsync(booking.ActiveHoldId.Value);
+                    if (activeHold != null && string.Equals(activeHold.Status, "Active", StringComparison.OrdinalIgnoreCase))
+                    {
+                        await tx.CommitAsync();
+                        return new CreateHoldResult(false, null, "booking already has an active hold");
+                    }
+                }
+
                 var voyage = await _db.VoyageCapacities.FindAsync(voyageId);
                 if (voyage == null)
                 {
@@ -118,6 +151,8 @@ namespace Logistics.Infrastructure.Services
                 var reserved = await _voyageRepo.TryReserveAtomic(voyageId, units);
                 if (!reserved)
                 {
+                    LogisticsMetrics.CapacityConflict.Add(1, new KeyValuePair<string, object?>("voyage_id", voyageId));
+                    _logger.LogWarning("Capacity hold rejected for booking {BookingId} on voyage {VoyageId}: insufficient capacity or closed voyage", bookingId, voyageId);
                     if (!string.IsNullOrEmpty(idempotencyKey))
                     {
                         var existing = await _db.IdempotencyEntries.FindAsync(idempotencyKey);
@@ -185,22 +220,27 @@ namespace Logistics.Infrastructure.Services
                 await _db.SaveChangesAsync();
                 await tx.CommitAsync();
 
+                LogisticsMetrics.CapacityHoldCreated.Add(1, new KeyValuePair<string, object?>("voyage_id", voyageId));
+                _logger.LogInformation("Capacity hold created {HoldId} for booking {BookingId} on voyage {VoyageId} for {Units} units", holdId, bookingId, voyageId, units);
+
                 return new CreateHoldResult(true, holdId, null);
             }
             catch (Exception ex)
             {
                 await tx.RollbackAsync();
-                // ensure idempotency record reflects failure
                 if (!string.IsNullOrEmpty(idempotencyKey))
                 {
-                    var existing = await _db.IdempotencyEntries.FindAsync(idempotencyKey);
+                    _db.ChangeTracker.Clear();
+                    var existing = await _db.IdempotencyEntries.AsNoTracking().SingleOrDefaultAsync(x => x.IdempotencyKey == idempotencyKey);
                     if (existing != null)
                     {
-                        existing.Status = "Failed";
-                        existing.ResponseStatusCode = 500;
-                        existing.ResponseBody = ex.Message;
-                        existing.CompletedAt = await _clock.GetUtcNowAsync();
-                        await _db.SaveChangesAsync();
+                        if (!string.Equals(existing.RequestHash, requestFingerprint, StringComparison.OrdinalIgnoreCase))
+                            return new CreateHoldResult(false, null, "Idempotency key reused with different payload");
+                        if (existing.Status == "Completed" && !string.IsNullOrEmpty(existing.ResultJson))
+                            return JsonSerializer.Deserialize<CreateHoldResult>(existing.ResultJson) ?? new CreateHoldResult(false, null, "previous result missing");
+                        if (existing.Status == "Failed")
+                            return new CreateHoldResult(false, null, existing.ResponseBody ?? "request failed");
+                        return new CreateHoldResult(false, null, "Request is already in progress");
                     }
                 }
                 return new CreateHoldResult(false, null, ex.Message);
@@ -209,6 +249,7 @@ namespace Logistics.Infrastructure.Services
 
         public async Task<(bool Success, string? Reason)> ConfirmBookingAsync(Guid bookingId, Guid holdId, string? idempotencyKey = null)
         {
+            var confirmationTimer = Stopwatch.StartNew();
             var requestFingerprint = ComputeHash(new { BookingId = bookingId, HoldId = holdId });
             await using var tx = await _db.Database.BeginTransactionAsync();
             try
@@ -280,6 +321,18 @@ namespace Logistics.Infrastructure.Services
                     return (false, "hold not found");
                 }
 
+                if (hold.BookingId != bookingId || hold.VoyageId != booking.VoyageId)
+                {
+                    await tx.CommitAsync();
+                    return (false, "hold does not belong to booking");
+                }
+
+                if (hold.Status == "Confirmed" && booking.State == "Confirmed" && booking.ActiveHoldId == holdId)
+                {
+                    await tx.CommitAsync();
+                    return (true, null);
+                }
+
                 if (hold.Status != "Active")
                 {
                     if (!string.IsNullOrEmpty(idempotencyKey))
@@ -324,6 +377,7 @@ namespace Logistics.Infrastructure.Services
 
                 // Update booking state
                 booking.State = "Confirmed";
+                booking.ActiveHoldId = holdId;
                 booking.Version++;
                 _db.Bookings.Update(booking);
 
@@ -359,26 +413,68 @@ namespace Logistics.Infrastructure.Services
 
                 await _db.SaveChangesAsync();
                 await tx.CommitAsync();
+                LogisticsMetrics.CapacityHoldConfirmed.Add(1, new KeyValuePair<string, object?>("voyage_id", hold.VoyageId));
+                LogisticsMetrics.ConfirmationDuration.Record(confirmationTimer.Elapsed.TotalSeconds);
+                _logger.LogInformation("Capacity hold confirmed {HoldId} for booking {BookingId} on voyage {VoyageId}", holdId, bookingId, hold.VoyageId);
                 return (true, null);
             }
             catch (Exception ex)
             {
                 await tx.RollbackAsync();
-                // ensure idempotency record reflects failure
                 if (!string.IsNullOrEmpty(idempotencyKey))
                 {
-                    var existing = await _db.IdempotencyEntries.FindAsync(idempotencyKey);
+                    _db.ChangeTracker.Clear();
+                    var existing = await _db.IdempotencyEntries.AsNoTracking().SingleOrDefaultAsync(x => x.IdempotencyKey == idempotencyKey);
                     if (existing != null)
                     {
-                        existing.Status = "Failed";
-                        existing.ResponseStatusCode = 500;
-                        existing.ResponseBody = ex.Message;
-                        existing.CompletedAt = await _clock.GetUtcNowAsync();
-                        await _db.SaveChangesAsync();
+                        if (!string.Equals(existing.RequestHash, requestFingerprint, StringComparison.OrdinalIgnoreCase))
+                            return (false, "Idempotency key reused with different payload");
+                        if (existing.Status == "Completed")
+                            return (true, null);
+                        if (existing.Status == "Failed")
+                            return (false, existing.ResponseBody ?? "request failed");
+                        return (false, "Request is already in progress");
                     }
                 }
                 return (false, ex.Message);
             }
+        }
+
+        public async Task<CapacityHoldResult?> GetCapacityHoldAsync(Guid bookingId)
+        {
+            var hold = await _db.CapacityHolds
+                .AsNoTracking()
+                .Where(x => x.BookingId == bookingId)
+                .OrderByDescending(x => x.CreatedAt)
+                .FirstOrDefaultAsync();
+
+            return hold == null
+                ? null
+                : new CapacityHoldResult(
+                    hold.HoldId,
+                    hold.BookingId,
+                    hold.VoyageId,
+                    hold.CapacityUnits,
+                    hold.CreatedAt,
+                    hold.ExpiresAt,
+                    hold.Status);
+        }
+
+        public async Task<VoyageCapacityResult?> GetVoyageCapacityAsync(Guid voyageId)
+        {
+            var voyage = await _db.VoyageCapacities
+                .AsNoTracking()
+                .SingleOrDefaultAsync(x => x.VoyageId == voyageId);
+
+            return voyage == null
+                ? null
+                : new VoyageCapacityResult(
+                    voyage.VoyageId,
+                    voyage.TotalCapacity,
+                    voyage.HeldCapacity,
+                    voyage.ConfirmedCapacity,
+                    voyage.TotalCapacity - voyage.HeldCapacity - voyage.ConfirmedCapacity,
+                    voyage.OperationalStatus);
         }
     }
 }

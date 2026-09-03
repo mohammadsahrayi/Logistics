@@ -35,10 +35,29 @@ namespace Logistics.Api.Controllers
         }
 
         [HttpGet("/api/bookings/{bookingId:guid}/capacity-hold")]
-        public IActionResult GetHold([FromRoute] Guid bookingId)
+        public async Task<IActionResult> GetHold([FromRoute] Guid bookingId)
         {
-            // For now return a placeholder; real implementation in later phase
-            return NotFound();
+            var hold = await _capacityService.GetCapacityHoldAsync(bookingId);
+            return hold == null ? NotFound() : Ok(hold);
+        }
+    }
+
+    [ApiController]
+    [Route("api/voyages")]
+    public class VoyagesController : ControllerBase
+    {
+        private readonly ICapacityService _capacityService;
+
+        public VoyagesController(ICapacityService capacityService)
+        {
+            _capacityService = capacityService;
+        }
+
+        [HttpGet("{voyageId:guid}/capacity")]
+        public async Task<IActionResult> GetCapacity([FromRoute] Guid voyageId)
+        {
+            var capacity = await _capacityService.GetVoyageCapacityAsync(voyageId);
+            return capacity == null ? NotFound() : Ok(capacity);
         }
     }
 

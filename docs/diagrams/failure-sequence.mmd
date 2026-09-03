@@ -1,0 +1,31 @@
+sequenceDiagram
+    participant C as Confirm request
+    participant E as Expiry worker
+    participant H as PostgreSQL hold row
+    participant V as PostgreSQL capacity row
+    participant O as Outbox
+    participant B as Broker
+    participant D as Inbox consumer
+
+    par Confirm-vs-Expire race
+        C->>H: Begin transaction; verify Active and DB time < expires_at
+        C->>H: Conditional Active -> Confirmed
+        C->>V: held - units; confirmed + units
+        C->>O: Insert BookingConfirmed atomically
+    and
+        E->>H: Begin transaction; verify Active and DB time >= expires_at
+        E->>H: Conditional Active -> Expired
+        E->>V: held - units
+        E->>O: Insert CapacityHoldExpired atomically
+    end
+    Note over H,V: Row locks and conditional state transition allow one terminal winner
+
+    O->>B: Publish pending message
+    B-->>O: Transient failure
+    O->>O: Keep unprocessed; increment attempt/error
+    O->>B: Retry after next poll
+    B->>D: At-least-once delivery with stable MessageId
+    D->>D: INSERT inbox ON CONFLICT DO NOTHING
+    D->>D: Apply one downstream effect transactionally
+    B->>D: Duplicate delivery
+    D-->>D: No-op because inbox MessageId already exists

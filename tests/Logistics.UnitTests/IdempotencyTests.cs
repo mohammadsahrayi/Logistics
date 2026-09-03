@@ -148,6 +148,97 @@ namespace Logistics.UnitTests
             entry.CompletedAt.Should().NotBeNull();
         }
 
+        [Fact]
+        public async Task Create_hold_rejects_booking_from_different_voyage()
+        {
+            var ctx = CreateContext();
+            var service = CreateService(ctx);
+            var bookingVoyageId = Guid.NewGuid();
+            var requestedVoyageId = Guid.NewGuid();
+            var bookingId = Guid.NewGuid();
+            await SeedVoyageAndBooking(ctx, bookingVoyageId, bookingId, 5);
+            ctx.VoyageCapacities.Add(new VoyageCapacityEntity
+            {
+                VoyageId = requestedVoyageId,
+                TotalCapacity = 5,
+                OperationalStatus = "Open",
+                CreatedAt = DateTime.UtcNow
+            });
+            await ctx.SaveChangesAsync();
+
+            var result = await service.CreateHoldAsync(bookingId, requestedVoyageId, 1, TimeSpan.FromMinutes(5));
+
+            result.Success.Should().BeFalse();
+            result.Reason.Should().Contain("does not belong to voyage");
+        }
+
+        [Fact]
+        public async Task Create_hold_rejects_second_active_hold_for_booking()
+        {
+            var ctx = CreateContext();
+            var service = CreateService(ctx);
+            var voyageId = Guid.NewGuid();
+            var bookingId = Guid.NewGuid();
+            await SeedVoyageAndBooking(ctx, voyageId, bookingId, 5);
+
+            var first = await service.CreateHoldAsync(bookingId, voyageId, 1, TimeSpan.FromMinutes(5));
+            var second = await service.CreateHoldAsync(bookingId, voyageId, 1, TimeSpan.FromMinutes(5));
+
+            first.Success.Should().BeTrue();
+            second.Success.Should().BeFalse();
+            second.Reason.Should().Contain("already has an active hold");
+            ctx.ChangeTracker.Clear();
+            (await ctx.VoyageCapacities.FindAsync(voyageId)).HeldCapacity.Should().Be(1);
+        }
+
+        [Fact]
+        public async Task Create_hold_rejects_non_positive_ttl()
+        {
+            var ctx = CreateContext();
+            var service = CreateService(ctx);
+            var voyageId = Guid.NewGuid();
+            var bookingId = Guid.NewGuid();
+            await SeedVoyageAndBooking(ctx, voyageId, bookingId, 5);
+
+            var result = await service.CreateHoldAsync(bookingId, voyageId, 1, TimeSpan.Zero);
+
+            result.Success.Should().BeFalse();
+            result.Reason.Should().Contain("ttl must be greater than zero");
+        }
+
+        [Fact]
+        public async Task Create_hold_rejects_closed_voyage()
+        {
+            var ctx = CreateContext();
+            var service = CreateService(ctx);
+            var voyageId = Guid.NewGuid();
+            var bookingId = Guid.NewGuid();
+            await SeedVoyageAndBooking(ctx, voyageId, bookingId, 5);
+            var voyage = await ctx.VoyageCapacities.FindAsync(voyageId);
+            voyage.OperationalStatus = "Closed";
+            await ctx.SaveChangesAsync();
+
+            var result = await service.CreateHoldAsync(bookingId, voyageId, 1, TimeSpan.FromMinutes(5));
+
+            result.Success.Should().BeFalse();
+            result.Reason.Should().Contain("insufficient capacity or closed");
+        }
+
+        [Fact]
+        public async Task Create_hold_rejects_insufficient_capacity()
+        {
+            var ctx = CreateContext();
+            var service = CreateService(ctx);
+            var voyageId = Guid.NewGuid();
+            var bookingId = Guid.NewGuid();
+            await SeedVoyageAndBooking(ctx, voyageId, bookingId, 1);
+
+            var result = await service.CreateHoldAsync(bookingId, voyageId, 2, TimeSpan.FromMinutes(5));
+
+            result.Success.Should().BeFalse();
+            result.Reason.Should().Contain("insufficient capacity or closed");
+        }
+
         private class TestClock : IClock
         {
             public Task<DateTime> GetUtcNowAsync() => Task.FromResult(DateTime.UtcNow);

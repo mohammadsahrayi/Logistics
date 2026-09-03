@@ -1,0 +1,31 @@
+flowchart TB
+    subgraph Logistics[Logistics Modular Monolith]
+        API[Task-oriented API]
+        Application[Application contracts]
+        Domain[Domain model]
+        Infrastructure[Infrastructure services]
+    end
+
+    subgraph Aggregates[Consistency Boundaries]
+        Voyage[VoyageCapacity aggregate root\nOwns held + confirmed <= total]
+        Booking[Booking aggregate root\nOwns confirmation and active hold reference]
+        Hold[CapacityHold aggregate root\nOwns Active -> Confirmed or Expired]
+    end
+
+    DB[(PostgreSQL authoritative store)]
+    Outbox[Transactional Outbox]
+    Inbox[Inbox + confirmation projection]
+
+    API --> Application --> Infrastructure
+    Infrastructure --> Domain
+    Infrastructure --> Voyage
+    Infrastructure --> Booking
+    Infrastructure --> Hold
+    Voyage -->|atomic conditional update| DB
+    Booking --> DB
+    Hold --> DB
+    Infrastructure --> Outbox --> DB
+    Infrastructure --> Inbox --> DB
+
+    note[One deployable process; aggregate, table, and deployment boundaries are distinct]
+    Domain --- note

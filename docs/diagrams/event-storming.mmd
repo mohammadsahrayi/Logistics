@@ -1,0 +1,37 @@
+flowchart LR
+    actor[Customer / Booking API]
+    expiry[Expiry Worker]
+    publisher[Outbox Publisher]
+    broker[Messaging Transport]
+    consumer[Downstream Consumer]
+    db[(PostgreSQL)]
+
+    actor --> cmd1[CapacityHoldRequested]
+    cmd1 --> policy1[Validate Booking, Voyage, TTL]
+    policy1 --> aggregate1[VoyageCapacity + CapacityHold transaction]
+    aggregate1 --> event1[CapacityHoldCreated]
+    aggregate1 --> reject[CapacityHoldRejected]
+
+    actor --> cmd2[BookingConfirmationRequested]
+    cmd2 --> policy2[Validate ownership, active state, authoritative DB time]
+    policy2 --> aggregate2[Confirm hold + convert capacity]
+    aggregate2 --> event2[BookingConfirmed]
+
+    expiry --> cmd3[Expire due hold]
+    cmd3 --> policy3[Conditional Active and expires_at check]
+    policy3 --> aggregate3[Release capacity transaction]
+    aggregate3 --> event3[CapacityHoldExpired / CapacityReleased]
+
+    event1 --> db
+    event2 --> db
+    event3 --> db
+    event1 -. outbox .-> publisher
+    event2 -. outbox .-> publisher
+    event3 -. outbox .-> publisher
+    publisher --> broker --> consumer
+    consumer --> inbox[Inbox uniqueness + downstream effect]
+    inbox --> db
+
+    hotspot{{Hotspots: voyage row, confirm-vs-expire race, duplicate commands, broker failure}}
+    aggregate1 --- hotspot
+    aggregate2 --- hotspot

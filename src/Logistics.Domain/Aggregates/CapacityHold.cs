@@ -18,6 +18,7 @@ namespace Logistics.Domain.Aggregates
         public CapacityHold(Guid holdId, Guid bookingId, Guid voyageId, int units, DateTime createdAt, TimeSpan ttl)
         {
             if (units <= 0) throw new ArgumentException("units must be > 0", nameof(units));
+            if (ttl <= TimeSpan.Zero) throw new ArgumentException("ttl must be greater than zero", nameof(ttl));
             HoldId = holdId;
             BookingId = bookingId;
             VoyageId = voyageId;

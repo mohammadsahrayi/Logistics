@@ -3,17 +3,20 @@ using System;
 using Logistics.Infrastructure.Persistence;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Infrastructure;
+using Microsoft.EntityFrameworkCore.Migrations;
 using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
 using Npgsql.EntityFrameworkCore.PostgreSQL.Metadata;
 
 #nullable disable
 
-namespace Logistics.Infrastructure.Migrations.InitialCreate
+namespace Logistics.Infrastructure.Migrations.AddBookingConfirmationProjection
 {
     [DbContext(typeof(LogisticsDbContext))]
-    partial class LogisticsDbContextModelSnapshot : ModelSnapshot
+    [Migration("20260903160050_AddBookingConfirmationProjection")]
+    partial class AddBookingConfirmationProjection
     {
-        protected override void BuildModel(ModelBuilder modelBuilder)
+        /// <inheritdoc />
+        protected override void BuildTargetModel(ModelBuilder modelBuilder)
         {
 #pragma warning disable 612, 618
             modelBuilder
@@ -143,11 +146,6 @@ namespace Logistics.Infrastructure.Migrations.InitialCreate
                         .HasColumnName("voyage_id");
 
                     b.HasKey("HoldId");
-
-                    b.HasIndex("BookingId")
-                        .IsUnique()
-                        .HasDatabaseName("ux_capacity_hold_active_booking")
-                        .HasFilter("status = 'Active'");
 
                     b.HasIndex("VoyageId");
 

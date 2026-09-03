@@ -93,6 +93,8 @@ namespace Logistics.Infrastructure.Services
                         continue;
                     }
 
+                    LogisticsMetrics.ExpiryLagSeconds.Record(Math.Max(0, (dbNow - h.ExpiresAt).TotalSeconds));
+
                     // Update status in the same transaction and clear the change tracker before re-reading this row
                     // so the caller sees the fresh persisted state rather than a stale tracked entity.
                     var updateSql = @"UPDATE capacity_hold SET status = @p0, version = version + 1, updated_at = @p1 WHERE hold_id = @p2 AND status = 'Active' AND (expires_at <= @p3)";
@@ -111,6 +113,14 @@ namespace Logistics.Infrastructure.Services
                         continue;
                     }
 
+                    var booking = await _db.Bookings.SingleOrDefaultAsync(x => x.BookingId == h.BookingId, ct);
+                    if (booking != null && booking.ActiveHoldId == h.HoldId)
+                    {
+                        booking.ActiveHoldId = null;
+                        booking.Version++;
+                        booking.UpdatedAt = dbNow;
+                    }
+
                     // release reserved on voyage
                     await _voyageRepo.ReleaseReserved(h.VoyageId, h.CapacityUnits);
 
@@ -121,6 +131,8 @@ namespace Logistics.Infrastructure.Services
 
                     await tx.CommitAsync(ct);
 
+                    LogisticsMetrics.CapacityHoldExpired.Add(1, new KeyValuePair<string, object?>("voyage_id", h.VoyageId));
+                    _logger.LogInformation("Capacity hold expired {HoldId} for booking {BookingId} on voyage {VoyageId}", h.HoldId, h.BookingId, h.VoyageId);
                     processed++;
                 }
                 catch (Exception ex)

@@ -15,6 +15,7 @@ namespace Logistics.Infrastructure.Persistence
         public DbSet<BookingEntity> Bookings { get; set; }
         public DbSet<OutboxMessageEntity> OutboxMessages { get; set; }
         public DbSet<InboxEntryEntity> InboxEntries { get; set; }
+        public DbSet<BookingConfirmationProjectionEntity> BookingConfirmationProjections { get; set; }
         public DbSet<IdempotencyEntryEntity> IdempotencyEntries { get; set; }
 
         protected override void OnModelCreating(ModelBuilder modelBuilder)
@@ -61,6 +62,10 @@ namespace Logistics.Infrastructure.Persistence
 
                 // Index to support lookup of active hold per booking
                 b.HasIndex(x => new { x.BookingId, x.Status }).HasDatabaseName("ix_capacity_hold_booking_status");
+                b.HasIndex(x => x.BookingId)
+                    .HasDatabaseName("ux_capacity_hold_active_booking")
+                    .IsUnique()
+                    .HasFilter("status = 'Active'");
 
                 // Foreign keys
                 b.HasOne<BookingEntity>().WithMany().HasForeignKey(x => x.BookingId).HasConstraintName("fk_capacityhold_booking").OnDelete(Microsoft.EntityFrameworkCore.DeleteBehavior.Restrict);
@@ -112,6 +117,19 @@ namespace Logistics.Infrastructure.Persistence
                 b.HasKey(x => x.MessageId);
                 b.Property(x => x.MessageId).HasColumnName("message_id");
                 b.Property(x => x.ReceivedAt).HasColumnName("received_at");
+            });
+
+            modelBuilder.Entity<BookingConfirmationProjectionEntity>(b =>
+            {
+                b.ToTable("booking_confirmation_projection");
+                b.HasKey(x => x.BookingId);
+                b.Property(x => x.BookingId).HasColumnName("booking_id");
+                b.Property(x => x.MessageId).HasColumnName("message_id");
+                b.Property(x => x.HoldId).HasColumnName("hold_id");
+                b.Property(x => x.VoyageId).HasColumnName("voyage_id");
+                b.Property(x => x.CapacityUnits).HasColumnName("capacity_units");
+                b.Property(x => x.ReceivedAt).HasColumnName("received_at");
+                b.HasIndex(x => x.MessageId).IsUnique();
             });
 
             modelBuilder.Entity<IdempotencyEntryEntity>(b =>
@@ -184,6 +202,16 @@ namespace Logistics.Infrastructure.Persistence
     public class InboxEntryEntity
     {
         public Guid MessageId { get; set; }
+        public DateTime ReceivedAt { get; set; }
+    }
+
+    public class BookingConfirmationProjectionEntity
+    {
+        public Guid BookingId { get; set; }
+        public Guid MessageId { get; set; }
+        public Guid HoldId { get; set; }
+        public Guid VoyageId { get; set; }
+        public int CapacityUnits { get; set; }
         public DateTime ReceivedAt { get; set; }
     }
 }
