@@ -36,10 +36,10 @@ UPDATE voyage_capacity
             if (units <= 0) throw new ArgumentException("units must be > 0", nameof(units));
 
             var sql = @"
-UPDATE voyage_capacity
-            SET held_capacity = held_capacity - @p0, confirmed_capacity = confirmed_capacity + @p0, version = version + 1
-            WHERE voyage_id = @p1 AND (held_capacity - @p0) >= 0
-";
+                    UPDATE voyage_capacity
+                                SET held_capacity = held_capacity - @p0, confirmed_capacity = confirmed_capacity + @p0, version = version + 1
+                                WHERE voyage_id = @p1 AND (held_capacity - @p0) >= 0
+                    ";
             var affected = await _db.Database.ExecuteSqlRawAsync(sql, units, voyageId);
             if (affected != 1) throw new InvalidOperationException("Failed to confirm reserved capacity (concurrent modification or insufficient held capacity)");
         }

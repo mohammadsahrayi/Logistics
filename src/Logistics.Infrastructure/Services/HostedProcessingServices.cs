@@ -1,3 +1,4 @@
+using Logistics.Shared.Messaging;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
@@ -77,20 +78,32 @@ namespace Logistics.Infrastructure.Services
             _logger.LogInformation("Outbox publisher hosted service stopped");
         }
     }
-
-    public sealed class LoggingMessageSender : IMessageSender
+    namespace Logistics.Infrastructure.Services
     {
-        private readonly ILogger<LoggingMessageSender> _logger;
-
-        public LoggingMessageSender(ILogger<LoggingMessageSender> logger)
+        public sealed class LoggingMessageSender : IMessageSender
         {
-            _logger = logger;
-        }
+            private readonly ILogger<LoggingMessageSender> _logger;
 
-        public Task SendAsync(Guid messageId, string messageType, string payload)
-        {
-            _logger.LogInformation("Message {MessageId} of type {MessageType} published", messageId, messageType);
-            return Task.CompletedTask;
+            public LoggingMessageSender(
+                ILogger<LoggingMessageSender> logger)
+            {
+                _logger = logger
+                    ?? throw new ArgumentNullException(nameof(logger));
+            }
+
+            public Task SendAsync(IntegrationEvent @event, CancellationToken ct = default)
+            {
+                ArgumentNullException.ThrowIfNull(@event);
+
+                ct.ThrowIfCancellationRequested();
+
+                _logger.LogInformation(
+                    "Publishing integration event {EventType} with Payload {Payload}",
+                    @event.Type,
+                    @event.Payload);
+
+                return Task.CompletedTask;
+            }
         }
     }
 }

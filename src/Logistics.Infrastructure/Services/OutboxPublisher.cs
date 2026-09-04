@@ -1,10 +1,7 @@
 using Logistics.Infrastructure.Persistence;
+using Logistics.Shared.Messaging;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Logging;
-using System;
-using System.Linq;
-using System.Threading;
-using System.Threading.Tasks;
 
 namespace Logistics.Infrastructure.Services
 {
@@ -12,23 +9,27 @@ namespace Logistics.Infrastructure.Services
     {
         private readonly LogisticsDbContext _db;
         private readonly IMessageSender _sender;
+        private readonly IIntegrationEventDeserializer _deserializer;
         private readonly ILogger<OutboxPublisher> _logger;
 
-        public OutboxPublisher(LogisticsDbContext db, IMessageSender sender)
-            : this(db, sender, Microsoft.Extensions.Logging.Abstractions.NullLogger<OutboxPublisher>.Instance)
-        {
-        }
-
-        public OutboxPublisher(LogisticsDbContext db, IMessageSender sender, ILogger<OutboxPublisher> logger)
+        public OutboxPublisher(
+            LogisticsDbContext db,
+            IMessageSender sender,
+            IIntegrationEventDeserializer deserializer,
+            ILogger<OutboxPublisher> logger)
         {
             _db = db ?? throw new ArgumentNullException(nameof(db));
             _sender = sender ?? throw new ArgumentNullException(nameof(sender));
-            _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+            _deserializer = deserializer
+                ?? throw new ArgumentNullException(nameof(deserializer));
+            _logger = logger
+                ?? throw new ArgumentNullException(nameof(logger));
         }
 
-        public async Task<int> PublishPendingAsync(int batchSize = 10, CancellationToken ct = default)
+        public async Task<int> PublishPendingAsync(
+            int batchSize = 10,
+            CancellationToken ct = default)
         {
-            // Select pending messages
             var pending = await _db.OutboxMessages
                 .Where(m => !m.Processed)
                 .OrderBy(m => m.OccurredAt)
@@ -36,42 +37,65 @@ namespace Logistics.Infrastructure.Services
                 .ToListAsync(ct);
 
             var processedCount = 0;
+
             LogisticsMetrics.OutboxBacklog.Record(pending.Count);
 
             foreach (var msg in pending)
             {
-                if (ct.IsCancellationRequested) break;
+                if (ct.IsCancellationRequested)
+                    break;
 
                 try
                 {
-                    // Attempt to send
-                    await _sender.SendAsync(msg.Id, msg.MessageType, msg.Payload);
+                    var integrationEvent = _deserializer.Deserialize(
+                        msg.MessageType,
+                        msg.Payload);
 
-                    // Mark as processed
+                    await _sender.SendAsync(
+                        integrationEvent,
+                        ct);
+
                     msg.Processed = true;
                     msg.PublishedAt = DateTime.UtcNow;
-                    msg.AttemptCount += 1;
+                    msg.AttemptCount++;
                     msg.LastError = null;
 
-                    _db.OutboxMessages.Update(msg);
                     await _db.SaveChangesAsync(ct);
 
-                    _logger.LogInformation("Outbox message published {MessageId} of type {MessageType}", msg.Id, msg.MessageType);
+                    _logger.LogInformation(
+                        "Outbox message published {MessageId} of type {MessageType}",
+                        msg.Id,
+                        msg.MessageType);
+
                     processedCount++;
                 }
                 catch (Exception ex)
                 {
-                    // Record failure and increment attempt count
-                    msg.AttemptCount += 1;
+                    msg.AttemptCount++;
                     msg.LastError = ex.Message;
-                    _db.OutboxMessages.Update(msg);
-                    await _db.SaveChangesAsync(ct);
-                    _logger.LogWarning(ex, "Outbox publication failed {MessageId} of type {MessageType}", msg.Id, msg.MessageType);
-                    // continue with other messages
+
+                    try
+                    {
+                        await _db.SaveChangesAsync(ct);
+                    }
+                    catch (Exception saveEx)
+                    {
+                        _logger.LogError(
+                            saveEx,
+                            "Failed to persist failure state for outbox message {MessageId}",
+                            msg.Id);
+                    }
+
+                    _logger.LogWarning(
+                        ex,
+                        "Outbox publication failed {MessageId} of type {MessageType}",
+                        msg.Id,
+                        msg.MessageType);
                 }
             }
 
             return processedCount;
         }
     }
+
 }

@@ -32,7 +32,7 @@ namespace Logistics.UnitTests
             return new CapacityService(ctx, repo, clock);
         }
 
-        private async Task SeedVoyageAndBooking(LogisticsDbContext ctx, Guid voyageId, Guid bookingId, int totalCapacity)
+        private Task SeedVoyageAndBooking(LogisticsDbContext ctx, Guid voyageId, Guid bookingId, int totalCapacity)
         {
             ctx.VoyageCapacities.Add(new VoyageCapacityEntity
             {
@@ -53,7 +53,7 @@ namespace Logistics.UnitTests
                 Version = 0,
                 CreatedAt = DateTime.UtcNow
             });
-            await ctx.SaveChangesAsync();
+            return ctx.SaveChangesAsync();
         }
 
         [Fact]
@@ -122,8 +122,8 @@ namespace Logistics.UnitTests
             res1.Success.Should().BeTrue();
 
             var entry = await ctx.IdempotencyEntries.FindAsync("key-4");
-            entry.ResponseStatusCode.Should().Be(201);
-            entry.ResponseBody.Should().NotBeNull();
+            entry?.ResponseStatusCode.Should().Be(201);
+            entry?.ResponseBody.Should().NotBeNull();
 
             var res2 = await service.CreateHoldAsync(bookingId, voyageId, 2, TimeSpan.FromMinutes(5), "key-4");
             res2.Success.Should().BeTrue();
@@ -188,7 +188,7 @@ namespace Logistics.UnitTests
             second.Success.Should().BeFalse();
             second.Reason.Should().Contain("already has an active hold");
             ctx.ChangeTracker.Clear();
-            (await ctx.VoyageCapacities.FindAsync(voyageId)).HeldCapacity.Should().Be(1);
+            (await ctx.VoyageCapacities.FindAsync(voyageId))?.HeldCapacity.Should().Be(1);
         }
 
         [Fact]
@@ -215,7 +215,7 @@ namespace Logistics.UnitTests
             var bookingId = Guid.NewGuid();
             await SeedVoyageAndBooking(ctx, voyageId, bookingId, 5);
             var voyage = await ctx.VoyageCapacities.FindAsync(voyageId);
-            voyage.OperationalStatus = "Closed";
+            voyage!.OperationalStatus = "Closed";
             await ctx.SaveChangesAsync();
 
             var result = await service.CreateHoldAsync(bookingId, voyageId, 1, TimeSpan.FromMinutes(5));

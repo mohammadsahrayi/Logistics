@@ -3,6 +3,7 @@
   <ItemGroup>
     <ProjectReference Include="..\Logistics.Domain\Logistics.Domain.csproj" />
     <ProjectReference Include="..\Logistics.Application\Logistics.Application.csproj" />
+    <ProjectReference Include="..\Logistics.Shared\Logistics.Shared.csproj" />
   </ItemGroup>
 
   <ItemGroup>

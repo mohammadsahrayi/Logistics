@@ -4,7 +4,7 @@ namespace Logistics.Infrastructure.Persistence
 {
     public class IdempotencyEntryEntity
     {
-        public string IdempotencyKey { get; set; }
+        public required string IdempotencyKey { get; set; }
         public DateTime CreatedAt { get; set; }
 
         // Request fingerprint to detect same-key/different-payload

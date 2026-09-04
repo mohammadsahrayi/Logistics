@@ -19,7 +19,9 @@
   </ItemGroup>
 
   <ItemGroup>
-    <ProjectReference Include="..\Logistics.Application\Logistics.Application.csproj" />
+    <ProjectReference Include="..\Logistics.Modules.Capacity\Logistics.Modules.Capacity.csproj" />
+    <ProjectReference Include="..\Logistics.Modules.Booking\Logistics.Modules.Booking.csproj" />
+    <ProjectReference Include="..\Logistics.Shared\Logistics.Shared.csproj" />
     <ProjectReference Include="..\Logistics.Infrastructure\Logistics.Infrastructure.csproj" />
   </ItemGroup>
 

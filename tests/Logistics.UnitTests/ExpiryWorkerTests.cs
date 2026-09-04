@@ -86,10 +86,10 @@ namespace Logistics.UnitTests
             Assert.True(processed >= 1, "At least one expired hold should have been processed");
 
             var h = await ctx.CapacityHolds.FindAsync(holdId);
-            Assert.Equal("Expired", h.Status);
+            Assert.Equal("Expired", h?.Status);
 
             var v = await ctx.VoyageCapacities.FindAsync(voyageId);
-            Assert.Equal(0, v.HeldCapacity);
+            Assert.Equal(0, v?.HeldCapacity);
 
             var outbox = await ctx.OutboxMessages.SingleAsync();
             Assert.Equal("CapacityHoldExpired", outbox.MessageType);
@@ -133,8 +133,8 @@ namespace Logistics.UnitTests
                         processed = await worker.ProcessExpiredHoldsOnceAsync();
 
                         processed.Should().Be(1);
-                        (await restartedContext.CapacityHolds.FindAsync(holdId)).Status.Should().Be("Expired");
-                        (await restartedContext.VoyageCapacities.FindAsync(voyageId)).HeldCapacity.Should().Be(0);
+                        (await restartedContext.CapacityHolds.FindAsync(holdId))?.Status.Should().Be("Expired");
+                        (await restartedContext.VoyageCapacities.FindAsync(voyageId))?.HeldCapacity.Should().Be(0);
                     }
                 }
             }

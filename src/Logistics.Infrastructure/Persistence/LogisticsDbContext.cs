@@ -22,23 +22,43 @@ namespace Logistics.Infrastructure.Persistence
         {
             modelBuilder.Entity<VoyageCapacityEntity>(b =>
             {
-                b.ToTable("voyage_capacity");
+                b.ToTable("voyage_capacity", t =>
+                {
+                    t.HasCheckConstraint(
+                        "ck_voyage_non_negative",
+                        "total_capacity >= 0 AND held_capacity >= 0 AND confirmed_capacity >= 0");
+
+                    t.HasCheckConstraint(
+                        "ck_voyage_capacity_sum",
+                        "(held_capacity + confirmed_capacity) <= total_capacity");
+                });
+
                 b.HasKey(x => x.VoyageId);
-                b.Property(x => x.VoyageId).HasColumnName("voyage_id");
-                b.Property(x => x.TotalCapacity).HasColumnName("total_capacity");
-                b.Property(x => x.HeldCapacity).HasColumnName("held_capacity");
-                b.Property(x => x.ConfirmedCapacity).HasColumnName("confirmed_capacity");
-                b.Property(x => x.OperationalStatus).HasColumnName("operational_status");
-                b.Property(x => x.Version).HasColumnName("version");
-                b.Property(x => x.CreatedAt).HasColumnName("created_at");
-                b.Property(x => x.UpdatedAt).HasColumnName("updated_at");
 
-                // checks
-                b.HasCheckConstraint("ck_voyage_non_negative", "total_capacity >= 0 AND held_capacity >= 0 AND confirmed_capacity >= 0");
-                b.HasCheckConstraint("ck_voyage_capacity_sum", "(held_capacity + confirmed_capacity) <= total_capacity");
+                b.Property(x => x.VoyageId)
+                    .HasColumnName("voyage_id");
 
-                // concurrency token
-                b.Property(x => x.Version).IsConcurrencyToken();
+                b.Property(x => x.TotalCapacity)
+                    .HasColumnName("total_capacity");
+
+                b.Property(x => x.HeldCapacity)
+                    .HasColumnName("held_capacity");
+
+                b.Property(x => x.ConfirmedCapacity)
+                    .HasColumnName("confirmed_capacity");
+
+                b.Property(x => x.OperationalStatus)
+                    .HasColumnName("operational_status");
+
+                b.Property(x => x.Version)
+                    .HasColumnName("version")
+                    .IsConcurrencyToken();
+
+                b.Property(x => x.CreatedAt)
+                    .HasColumnName("created_at");
+
+                b.Property(x => x.UpdatedAt)
+                    .HasColumnName("updated_at");
             });
 
             modelBuilder.Entity<CapacityHoldEntity>(b =>
@@ -156,7 +176,7 @@ namespace Logistics.Infrastructure.Persistence
         public int TotalCapacity { get; set; }
         public int HeldCapacity { get; set; }
         public int ConfirmedCapacity { get; set; }
-        public string OperationalStatus { get; set; }
+        public required string OperationalStatus { get; set; }
         public int Version { get; set; }
         public DateTime CreatedAt { get; set; }
         public DateTime? UpdatedAt { get; set; }
@@ -170,7 +190,7 @@ namespace Logistics.Infrastructure.Persistence
         public int CapacityUnits { get; set; }
         public DateTime CreatedAt { get; set; }
         public DateTime ExpiresAt { get; set; }
-        public string Status { get; set; }
+        public required string Status { get; set; }
         public int Version { get; set; }
         public DateTime? UpdatedAt { get; set; }
     }
@@ -180,7 +200,7 @@ namespace Logistics.Infrastructure.Persistence
         public Guid BookingId { get; set; }
         public Guid VoyageId { get; set; }
         public int RequestedCapacity { get; set; }
-        public string State { get; set; }
+        public string? State { get; set; }
         public Guid? ActiveHoldId { get; set; }
         public int Version { get; set; }
         public DateTime CreatedAt { get; set; }
@@ -190,8 +210,8 @@ namespace Logistics.Infrastructure.Persistence
     public class OutboxMessageEntity
     {
         public Guid Id { get; set; }
-        public string MessageType { get; set; }
-        public string Payload { get; set; }
+        public required string MessageType { get; set; }
+        public required string Payload { get; set; }
         public DateTime OccurredAt { get; set; }
         public bool Processed { get; set; }
         public DateTime? PublishedAt { get; set; }

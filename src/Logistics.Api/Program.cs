@@ -1,8 +1,13 @@
-using Logistics.Application.Contracts;
-using Logistics.Infrastructure.Repositories;
+using Logistics.Modules.Capacity;
+using Logistics.Modules.Booking;
+using Logistics.Modules.Capacity.Contracts;
+using Logistics.Infrastructure.Persistence;
 using Logistics.Infrastructure.Services;
+using Logistics.Shared;
+using Logistics.Shared.Messaging;
 using Logistics.Api.Infrastructure;
 using Microsoft.EntityFrameworkCore;
+using Logistics.Infrastructure.Services.Logistics.Infrastructure.Services;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -16,19 +21,25 @@ builder.Services.AddSwaggerGen();
 var connectionString = builder.Configuration.GetConnectionString("LogisticsDb")
     ?? throw new InvalidOperationException("ConnectionStrings:LogisticsDb is not configured.");
 
-builder.Services.AddDbContext<Logistics.Infrastructure.Persistence.LogisticsDbContext>(options =>
+builder.Services.AddDbContext<LogisticsDbContext>(options =>
     options.UseNpgsql(connectionString));
 
-// Repositories and services
-builder.Services.AddScoped<VoyageCapacityRepository>();
-builder.Services.AddScoped<ICapacityService, CapacityService>();
-builder.Services.AddScoped<IClock, DbClock>();
+// Register shared infrastructure
+builder.Services.AddScoped<IClock,DbClock>();
+builder.Services.AddScoped<IIntegrationEventDeserializer, IntegrationEventDeserializer>();;
+builder.Services.AddSingleton<IMessageSender, LoggingMessageSender>();
+
+// Register modules
+builder.Services.AddCapacityModule(null!);  // DbContext is resolved via DI
+builder.Services.AddBookingModule();
+
+// Background services
 builder.Services.AddScoped<ExpiryWorker>();
 builder.Services.AddScoped<OutboxPublisher>();
 builder.Services.AddScoped<IntegrationEventConsumer>();
-builder.Services.AddSingleton<IMessageSender, LoggingMessageSender>();
 builder.Services.AddHostedService<ExpiryWorkerHostedService>();
 builder.Services.AddHostedService<OutboxPublisherHostedService>();
+
 var app = builder.Build();
 
 // Configure the HTTP request pipeline.

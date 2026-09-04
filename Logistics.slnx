@@ -4,6 +4,9 @@
     <Project Path="src/Logistics.Application/Logistics.Application.csproj" />
     <Project Path="src/Logistics.Domain/Logistics.Domain.csproj" />
     <Project Path="src/Logistics.Infrastructure/Logistics.Infrastructure.csproj" />
+    <Project Path="src/Logistics.Modules.Booking/Logistics.Modules.Booking.csproj" />
+    <Project Path="src/Logistics.Modules.Capacity/Logistics.Modules.Capacity.csproj" />
+    <Project Path="src/Logistics.Shared/Logistics.Shared.csproj" />
   </Folder>
   <Folder Name="/tests/">
     <Project Path="tests/Logistics.IntegrationTests/Logistics.IntegrationTests.csproj" />
